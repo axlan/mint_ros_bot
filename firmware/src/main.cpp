@@ -167,7 +167,6 @@ geometry_msgs__msg__Twist cmd_msg;
 nav_msgs__msg__Odometry odom_msg;
 
 unsigned long long time_offset = 0;
-unsigned long prev_cmd_time = 0;
 unsigned long prev_odom_update = 0;
 Odometry odometry;
 
@@ -295,8 +294,7 @@ void MotorControllerCallback(rcl_timer_t *timer, int64_t last_call_time)
 // subscription callback function
 void SubscriptionCallback(const void *msgin)
 {
-  Serial.println("[SUB] Got command");
-  prev_cmd_time = millis();
+  Serial.println("[SUB] Got vel command");
 }
 
 bool CreateEntities()

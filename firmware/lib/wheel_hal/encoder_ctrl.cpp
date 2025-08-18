@@ -50,12 +50,15 @@ EncoderMeasurement SinglePinEncoderCtrl::GetEncoderMeasurement(bool is_in_revers
   interrupts();
 
   float delta_pos_m = float(local_encoder_ticks) * ticks_to_m_ratio;
+  if (is_in_reverse) {
+    delta_pos_m = -delta_pos_m;
+  }
 
   unsigned long now_us = micros();
-  float time_elapsed_sec = float(now_us - last_poll_time_us_) / 1e6;
+  float delta_time_sec = float(now_us - last_poll_time_us_) / 1e6;
   last_poll_time_us_ = now_us;
 
-  return EncoderMeasurement{delta_pos_m, time_elapsed_sec};
+  return EncoderMeasurement{delta_pos_m, delta_time_sec};
 }
 
 #undef WHEEL_HAL_IRAM_ATTR

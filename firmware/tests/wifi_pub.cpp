@@ -18,6 +18,12 @@ static constexpr int PIN_LED = 2;
 
 #include <std_msgs/msg/int32.h>
 
+// untracked file with:
+// char WIFI_SSID[] = "";
+// char WIFI_PASSWORD[] = "";
+// For some reason these need to be passed as mutable to set_microros_wifi_transports?
+#include "secrets.h"
+
 const IPAddress kAgentIP(192, 168, 1, 115);
 const uint16_t kAgentPort = 8888;
 
@@ -53,7 +59,7 @@ void setup() {
   digitalWrite(PIN_LED, LOW);
 
   set_microros_wifi_transports(
-    "my_wifi_ssid", "p455w0rd", kAgentIP, kAgentPort);
+    WIFI_SSID, WIFI_PASSWORD, kAgentIP, kAgentPort);
 
   delay(2000);
   digitalWrite(PIN_LED, HIGH);

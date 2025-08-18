@@ -5,6 +5,12 @@
 #include <rclc/executor.h>
 #include <std_msgs/msg/string.h>
 
+// untracked file with:
+// char WIFI_SSID[] = "";
+// char WIFI_PASSWORD[] = "";
+// For some reason these need to be passed as mutable to set_microros_wifi_transports?
+#include "secrets.h"
+
 static constexpr int PIN_LED = 2;
 
 // Network configuration
@@ -57,7 +63,7 @@ void setup() {
   digitalWrite(PIN_LED, LOW);
 
   set_microros_wifi_transports(
-    "my_wifi_ssid", "p455w0rd", kAgentIP, kAgentPort);
+    WIFI_SSID, WIFI_PASSWORD, kAgentIP, kAgentPort);
 
 
   // Initialize message buffers

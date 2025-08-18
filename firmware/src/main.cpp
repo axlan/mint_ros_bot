@@ -10,6 +10,12 @@
 #include <std_msgs/msg/int32.h>
 #include <geometry_msgs/msg/twist.h>
 
+// untracked file with:
+// char WIFI_SSID[] = "";
+// char WIFI_PASSWORD[] = "";
+// For some reason these need to be passed as mutable to set_microros_wifi_transports?
+#include "secrets.h"
+
 // Combines
 // www.hackster.io/amal-shaji/differential-drive-robot-using-ros2-and-esp32-aae289
 // https://github.com/micro-ROS/micro_ros_platformio/blob/main/examples/ethernet_pubsub/src/main.cpp
@@ -63,9 +69,6 @@ static constexpr int PWM_RESOLUTION = 8;
 ////// Network configuration
 static const IPAddress AGENT_IP(192, 168, 1, 115);
 static const uint16_t AGENT_PORT = 8888;
-// For some reason these need to be passed as mutable to set_microros_wifi_transports?
-char WIFI_SSID[] = "my_wifi_ssid";
-char WIFI_PASSWORD[] = "p455w0rd";
 
 ////// ROS node configuration
 static constexpr const char *ROS_NODE_NAME = "franken_mint_node";

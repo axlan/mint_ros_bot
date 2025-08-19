@@ -35,6 +35,9 @@ namespace wheel_hal
          * @brief Get the encoder measurement since last call.
          *
          * @param is_in_reverse If true, measurement is for reverse direction.
+         *        NOTE: For single pin encoders, any time between the motor
+         *        changing direction and a GetEncoderMeasurement will
+         *        incorrectly attribute ticks with the wrong direction.
          * @return EncoderMeasurement Struct containing position and time.
          */
         virtual EncoderMeasurement GetEncoderMeasurement(bool is_in_reverse = false) = 0;
@@ -88,7 +91,11 @@ namespace wheel_hal
         /**
          * @brief Get encoder measurement since last call.
          *
-         * Returns the distance traveled and time elapsed, then resets tick count.
+         * @param is_in_reverse If true, measurement is for reverse direction.
+         *        NOTE: Any time between the motor changing direction and a
+         *        GetEncoderMeasurement will incorrectly attribute ticks with
+         *        the wrong direction.
+         * @return EncoderMeasurement Struct containing position and time.
          */
         EncoderMeasurement GetEncoderMeasurement(bool is_in_reverse = false) override;
 

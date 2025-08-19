@@ -1,7 +1,5 @@
 #include <Arduino.h>
 
-#include <odometry.h>
-
 #include <micro_ros_platformio.h>
 #include <rcl/rcl.h>
 #include <rclc/rclc.h>
@@ -10,44 +8,51 @@
 #include <std_msgs/msg/int32.h>
 #include <geometry_msgs/msg/twist.h>
 
+#include <odometry.h>
+
+#include "motor_ctrl.h"
+#include "encoder_ctrl.h"
+
 // untracked file with:
 // char WIFI_SSID[] = "";
 // char WIFI_PASSWORD[] = "";
 // For some reason these need to be passed as mutable to set_microros_wifi_transports?
 #include "secrets.h"
 
+using namespace wheel_hal;
+
 // Combines
 // www.hackster.io/amal-shaji/differential-drive-robot-using-ros2-and-esp32-aae289
 // https://github.com/micro-ROS/micro_ros_platformio/blob/main/examples/ethernet_pubsub/src/main.cpp
 
 ////// Pin declarations
-
 static constexpr int8_t PIN_LED = 2;
 
 //// Left wheel
 // Control pins need to be able to generate PWM
-static constexpr int8_t PIN_L_FORW = 5;
-static constexpr int8_t PIN_L_BACK = 18;
+static constexpr int8_t PIN_R_FORW = 18;
+static constexpr int8_t PIN_R_BACK = 5;
 // Encoder needs to support interrupts.
-static constexpr int8_t PIN_L_ENCODER = 12;
+static constexpr int8_t PIN_R_ENCODER = 27;
 
 //// Right wheel
 // Control pins need to be able to generate PWM
-static constexpr int8_t PIN_R_FORW = 19;
-static constexpr int8_t PIN_R_BACK = 21;
+static constexpr int8_t PIN_L_FORW = 21;
+static constexpr int8_t PIN_L_BACK = 19;
 // Encoder needs to support interrupts.
-static constexpr int8_t PIN_R_ENCODER = 13;
+static constexpr int8_t PIN_L_ENCODER = 26;
 
 ////// Parameters of the robot
+////// Parameters of the robot
 // Units in meters
-static constexpr float WHEELS_Y_DISTANCE = 0.173;
+static constexpr float WHEELS_Y_DISTANCE = .173;
 static constexpr float WHEEL_RADIUS = 0.0245;
 static constexpr float WHEEL_CIRCUMFERENCE = 0.153;
 //// Encoder value per revolution of left wheel and right wheel
-static constexpr int TICK_PER_REVOLUTION_LW = 4000;
-static constexpr int TICK_PER_REVOLUTION_RW = 4000;
+static constexpr int TICK_PER_REVOLUTION = 4000;
 // Min value for PWM that moves wheels
 static constexpr int PWM_THRESHOLD = 100;
+
 //// PID constants of left wheel
 static constexpr float PID_KP_L = 1.8;
 static constexpr float PID_KI_L = 5;
@@ -56,15 +61,6 @@ static constexpr float PID_KD_L = 0.1;
 static constexpr float PID_KP_R = 1.8;
 static constexpr float PID_KI_R = 5;
 static constexpr float PID_KD_R = 0.1;
-
-
-//// pwm parameters setup
-static constexpr int PWM_FREQ = 30000;
-static constexpr int PWM_CHANNEL_L_FORW = 0;
-static constexpr int PWM_CHANNEL_L_BACK = 1;
-static constexpr int PWM_CHANNEL_R_FORW = 2;
-static constexpr int PWM_CHANNEL_R_BACK = 3;
-static constexpr int PWM_RESOLUTION = 8;
 
 ////// Network configuration
 static const IPAddress AGENT_IP(192, 168, 1, 115);
@@ -78,83 +74,96 @@ static constexpr int ROS_EXECUTOR_TIMEOUT = 100; // ms
 static constexpr unsigned int CONTROL_TIMER_PERIOD_MS = 100;
 
 // creating a class for motor control
-class MotorController
+class PIDFilter
 {
 public:
-  std_msgs__msg__Int32 EncoderCount;
-  volatile long CurrentPosition;
-  volatile long PreviousPosition;
-  volatile long CurrentTime;
-  volatile long PreviousTime;
-  volatile long CurrentTimeforError;
-  volatile long PreviousTimeForError;
-  float rpmFilt;
-  float eintegral;
-  float ederivative;
-  float rpmPrev;
-  float kp;
-  float ki;
-  float kd;
-  float error;
-  float previousError = 0;
-  int tick;
-  bool is_in_reverse = false;
-
-  MotorController(int tickPerRevolution)
+  PIDFilter(float proportionalGain, float integralGain, float derivativeGain) : kp(proportionalGain), ki(integralGain), kd(derivativeGain)
   {
-    this->tick = tickPerRevolution;
   }
 
-  // initializing the parameters of PID controller
-  void initPID(float proportionalGain, float integralGain, float derivativeGain)
+  float Update(float setpoint, float feedback, float time_delta_sec)
   {
-    kp = proportionalGain;
-    ki = integralGain;
-    kd = derivativeGain;
-  }
-
-  // function return rpm of the motor using the encoder tick values
-  float getRpm()
-  {
-    CurrentPosition = EncoderCount.data;
-    CurrentTime = millis();
-    float delta1 = ((float)CurrentTime - PreviousTime) / 1.0e3;
-    float velocity = ((float)CurrentPosition - PreviousPosition) / delta1;
-    float rpm = (velocity / tick) * 60;
-    rpmFilt = 0.854 * rpmFilt + 0.0728 * rpm + 0.0728 * rpmPrev;
-    float rpmPrev = rpm;
-    PreviousPosition = CurrentPosition;
-    PreviousTime = CurrentTime;
-    // Serial.println(rpmFilt);
-    return rpmFilt;
-  }
-
-  // pid controller
-  float pid(float setpoint, float feedback)
-  {
-    CurrentTimeforError = millis();
-    float delta2 = ((float)CurrentTimeforError - PreviousTimeForError) / 1.0e3;
-    error = setpoint - feedback;
-    eintegral = eintegral + (error * delta2);
-    ederivative = (error - previousError) / delta2;
+    float error = setpoint - feedback;
+    float eintegral = eintegral + (error * time_delta_sec);
+    float ederivative = (error - previous_error) / time_delta_sec;
     float control_signal = (kp * error) + (ki * eintegral) + (kd * ederivative);
 
-    previousError = error;
-    PreviousTimeForError = CurrentTimeforError;
+    previous_error = error;
     return control_signal;
   }
-  // move the robot wheels based the control signal generated by the pid controller
-  void moveBase(float ActuatingSignal, int threshold, int pwmChannel)
+
+private:
+  const float kp;
+  const float ki;
+  const float kd;
+  float previous_error = 0;
+};
+
+/**
+ * @brief Class for controlling brushed motor speed.
+ *
+ * This is fairly specific for this differential wheel PID controller. To make
+ * it more general, the interface may need to be rethought. Also, the ownership
+ * and types of class components (motor/encoder/filter/etc.) would probably need
+ * to be reworked.
+ */
+class PIDController
+{
+public:
+  // For managing the lifetime of the objects, these should probably be unique
+  // pointers. Leaving them as bare pointers for simplicity.
+  PIDController(BaseMotorCtrl *motor_ctrl,
+                BaseEncoderCtrl *encoder_ctrl,
+                PIDFilter *pid_filter) : motor_ctrl_(motor_ctrl), encoder_ctrl_(encoder_ctrl), pid_filter_(pid_filter) {}
+
+  void Setup()
   {
-    is_in_reverse = ActuatingSignal < 0;
-    int pwm = threshold + (int)fabs(ActuatingSignal);
-    if (pwm > 255)
-      pwm = 255;
-    ledcWrite(pwmChannel, pwm);
+    motor_ctrl_->SetupPins();
+    encoder_ctrl_->SetupPins();
   }
+
+  EncoderMeasurement Update(float cmd_velocity_mps)
+  {
+    // For single pin encoders:
+    // If the new command reverses the motor direction, any encoder ticks that
+    // occur between the measurement and the new command will be counted
+    // incorrectly.
+    EncoderMeasurement encoder_meas = encoder_ctrl_->GetEncoderMeasurement(is_in_reverse_);
+    float meas_vel_mps = encoder_meas.delta_pos_m / encoder_meas.delta_time_sec;
+
+    float actuating_signal = 0;
+    if (cmd_velocity_mps != 0)
+    {
+      actuating_signal = pid_filter_->Update(cmd_velocity_mps, meas_vel_mps, encoder_meas.delta_time_sec);
+    }
+
+    is_in_reverse_ = actuating_signal < 0;
+    motor_ctrl_->SetSpeed(abs(actuating_signal), is_in_reverse_);
+
+    return encoder_meas;
+  }
+
+private:
+  BaseMotorCtrl *motor_ctrl_ = nullptr;
+  BaseEncoderCtrl *encoder_ctrl_ = nullptr;
+  PIDFilter *pid_filter_ = nullptr;
+  bool is_in_reverse_ = false;
 };
 
 ////// Global variables
+
+// Motor interface
+SinglePinEncoderCtrl left_encoder(WHEEL_RADIUS, TICK_PER_REVOLUTION, PIN_L_ENCODER, INPUT, FALLING);
+SinglePinEncoderCtrl right_encoder(WHEEL_RADIUS, TICK_PER_REVOLUTION, PIN_R_ENCODER, INPUT, FALLING);
+AT8236MotorCtrl left_motor(PIN_L_FORW, PIN_L_BACK, PWM_THRESHOLD);
+AT8236MotorCtrl right_motor(PIN_R_FORW, PIN_R_BACK, PWM_THRESHOLD);
+
+// PID interface
+PIDFilter left_wheel_pid(PID_KP_L, PID_KI_L, PID_KD_L);
+PIDFilter right_wheel_pid(PID_KP_R, PID_KI_R, PID_KD_R);
+
+PIDController left_ctrl(&right_motor, &right_encoder, &right_wheel_pid);
+PIDController right_ctrl(&right_motor, &right_encoder, &right_wheel_pid);
 
 // ROS entities
 rclc_executor_t executor;
@@ -173,10 +182,6 @@ unsigned long long time_offset = 0;
 unsigned long prev_odom_update = 0;
 Odometry odometry;
 
-// creating objects for right wheel and left wheel
-MotorController leftWheel(TICK_PER_REVOLUTION_LW);
-MotorController rightWheel(TICK_PER_REVOLUTION_RW);
-
 // Connection management
 enum class ConnectionState
 {
@@ -187,24 +192,6 @@ enum class ConnectionState
   kDisconnected
 };
 ConnectionState connection_state = ConnectionState::kInitializing;
-
-// interrupt function for left wheel encoder.
-void IRAM_ATTR updateEncoderL()
-{
-  if (!leftWheel.is_in_reverse)
-    leftWheel.EncoderCount.data++;
-  else
-    leftWheel.EncoderCount.data--;
-}
-
-// interrupt function for right wheel encoder
-void IRAM_ATTR updateEncoderR()
-{
-  if (!rightWheel.is_in_reverse)
-    rightWheel.EncoderCount.data++;
-  else
-    rightWheel.EncoderCount.data--;
-}
 
 struct timespec getTime()
 {
@@ -240,57 +227,26 @@ void MotorControllerCallback(rcl_timer_t *timer, int64_t last_call_time)
   linearVelocity = cmd_msg.linear.x;
   angularVelocity = cmd_msg.angular.z;
   // linear and angular velocities are converted to leftwheel and rightwheel velocities
-  float vL = (linearVelocity - (angularVelocity * 1 / 2)) * 20;
-  float vR = (linearVelocity + (angularVelocity * 1 / 2)) * 20;
-  // current wheel rpm is calculated
-  float currentRpmL = leftWheel.getRpm();
-  float currentRpmR = rightWheel.getRpm();
-  // pid controlled is used for generating the pwm signal
-  float actuating_signal_LW = leftWheel.pid(vL, currentRpmL);
-  float actuating_signal_RW = rightWheel.pid(vR, currentRpmR);
-  if (vL == 0 && vR == 0)
-  {
-    actuating_signal_LW = 0;
-    actuating_signal_RW = 0;
-  }
-  else
-  {
-    if (actuating_signal_LW >= 0)
-    {
-      leftWheel.moveBase(actuating_signal_LW, PWM_THRESHOLD, PWM_CHANNEL_L_FORW);
-      leftWheel.moveBase(0, PWM_THRESHOLD, PWM_CHANNEL_L_BACK);
-    }
-    else
-    {
-      leftWheel.moveBase(actuating_signal_LW, PWM_THRESHOLD, PWM_CHANNEL_L_BACK);
-      leftWheel.moveBase(0, PWM_THRESHOLD, PWM_CHANNEL_L_FORW);
-    }
+  float vL = linearVelocity - (angularVelocity * WHEELS_Y_DISTANCE) / 2.0;
+  float vR = linearVelocity + (angularVelocity * WHEELS_Y_DISTANCE) / 2.0;
 
-    if (actuating_signal_RW >= 0)
-    {
-      rightWheel.moveBase(actuating_signal_RW, PWM_THRESHOLD, PWM_CHANNEL_R_FORW);
-      rightWheel.moveBase(0, PWM_THRESHOLD, PWM_CHANNEL_R_BACK);
-    }
-    else
-    {
-      rightWheel.moveBase(actuating_signal_RW, PWM_THRESHOLD, PWM_CHANNEL_R_BACK);
-      rightWheel.moveBase(0, PWM_THRESHOLD, PWM_CHANNEL_R_FORW);
-    }
-  }
+  EncoderMeasurement left_encoder_meas = left_ctrl.Update(vL);
+  float left_vel_mps = left_encoder_meas.delta_pos_m / left_encoder_meas.delta_time_sec;
+
+  EncoderMeasurement right_encoder_meas = right_ctrl.Update(vR);
+  float right_vel_mps = right_encoder_meas.delta_pos_m / right_encoder_meas.delta_time_sec;
+
+  // Mean time between encoder measurements.
+  float vel_dt = (left_encoder_meas.delta_time_sec + right_encoder_meas.delta_time_sec) / 2.0;
+
   // odometry
-  float average_rps_x = ((float)(currentRpmL + currentRpmR) / 2) / 60.0; // RPM
-  float linear_x = average_rps_x * WHEEL_CIRCUMFERENCE;                  // m/s
-  float average_rps_a = ((float)(-currentRpmL + currentRpmR) / 2) / 60.0;
-  float angular_z = (average_rps_a * WHEEL_CIRCUMFERENCE) / (WHEELS_Y_DISTANCE / 2.0); //  rad/s
-  float linear_y = 0;
-  unsigned long now = millis();
-  float vel_dt = (now - prev_odom_update) / 1000.0;
-  prev_odom_update = now;
+  float meas_linear_vel_mps = (left_vel_mps + right_vel_mps) / 2.0;
+  float meas_angular_vel_rps = (right_vel_mps - left_vel_mps) / WHEELS_Y_DISTANCE;
   odometry.update(
       vel_dt,
-      linear_x,
-      linear_y,
-      angular_z);
+      meas_linear_vel_mps,
+      0,
+      meas_angular_vel_rps);
   publishData();
 }
 
@@ -446,37 +402,11 @@ void setup()
   Serial.begin(115200);
   Serial.println("[INIT] Starting micro-ROS node...");
 
-  pinMode(PIN_L_FORW, OUTPUT);
-  pinMode(PIN_L_BACK, OUTPUT);
-  pinMode(PIN_L_ENCODER, INPUT_PULLUP);
-
-  pinMode(PIN_R_FORW, OUTPUT);
-  pinMode(PIN_R_BACK, OUTPUT);
-  pinMode(PIN_R_ENCODER, INPUT_PULLUP);
-
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, LOW);
 
-
-  // initializing the pid constants
-  leftWheel.initPID(PID_KP_L, PID_KI_L, PID_KD_L);
-  rightWheel.initPID(PID_KP_R, PID_KI_R, PID_KD_R);
-
-  // initializing interrupt functions for counting the encoder tick values
-  // For my particular model the falling edge was much sharper.
-  attachInterrupt(digitalPinToInterrupt(PIN_L_ENCODER), updateEncoderL, FALLING);
-  attachInterrupt(digitalPinToInterrupt(PIN_R_ENCODER), updateEncoderR, FALLING);
-
-  // initializing pwm signal parameters
-  ledcSetup(PWM_CHANNEL_L_FORW, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttachPin(PIN_L_FORW, PWM_CHANNEL_L_FORW);
-  ledcSetup(PWM_CHANNEL_L_BACK, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttachPin(PIN_L_BACK, PWM_CHANNEL_L_BACK);
-  ledcSetup(PWM_CHANNEL_R_FORW, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttachPin(PIN_R_FORW, PWM_CHANNEL_R_FORW);
-  ledcSetup(PWM_CHANNEL_R_BACK, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttachPin(PIN_R_BACK, PWM_CHANNEL_R_BACK);
-
+  left_ctrl.Setup();
+  right_ctrl.Setup();
 
   set_microros_wifi_transports(WIFI_SSID, WIFI_PASSWORD, AGENT_IP, AGENT_PORT);
 

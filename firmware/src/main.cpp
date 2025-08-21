@@ -1,421 +1,368 @@
 #include <Arduino.h>
+#include <ArduinoOTA.h>
 
-#include <micro_ros_platformio.h>
-#include <rcl/rcl.h>
-#include <rclc/rclc.h>
-#include <rclc/executor.h>
-#include <rclc/timer.h>
-#include <std_msgs/msg/int32.h>
-#include <geometry_msgs/msg/twist.h>
-
-#include <odometry.h>
+#include <MQTT.h> // https://github.com/256dpi/arduino-mqtt
 
 #include "motor_ctrl.h"
 #include "encoder_ctrl.h"
 
-// untracked file with:
-// char WIFI_SSID[] = "";
-// char WIFI_PASSWORD[] = "";
-// For some reason these need to be passed as mutable to set_microros_wifi_transports?
-#include "secrets.h"
+#include "WifiManagerParamHelper.h"
 
 using namespace wheel_hal;
-
-// Combines
-// www.hackster.io/amal-shaji/differential-drive-robot-using-ros2-and-esp32-aae289
-// https://github.com/micro-ROS/micro_ros_platformio/blob/main/examples/ethernet_pubsub/src/main.cpp
 
 ////// Pin declarations
 static constexpr int8_t PIN_LED = 2;
 
 //// Left wheel
 // Control pins need to be able to generate PWM
-static constexpr int8_t PIN_R_FORW = 18;
-static constexpr int8_t PIN_R_BACK = 5;
+static constexpr int8_t PIN_R_FORW = 25;
+static constexpr int8_t PIN_R_BACK = 26;
 // Encoder needs to support interrupts.
-static constexpr int8_t PIN_R_ENCODER = 27;
+static constexpr int8_t PIN_R_ENCODER = 14;
 
 //// Right wheel
 // Control pins need to be able to generate PWM
-static constexpr int8_t PIN_L_FORW = 21;
-static constexpr int8_t PIN_L_BACK = 19;
+static constexpr int8_t PIN_L_FORW = 32;
+static constexpr int8_t PIN_L_BACK = 33;
 // Encoder needs to support interrupts.
-static constexpr int8_t PIN_L_ENCODER = 26;
+static constexpr int8_t PIN_L_ENCODER = 27;
 
-////// Parameters of the robot
 ////// Parameters of the robot
 // Units in meters
 static constexpr float WHEELS_Y_DISTANCE = .173;
 static constexpr float WHEEL_RADIUS = 0.0245;
 static constexpr float WHEEL_CIRCUMFERENCE = 0.153;
 //// Encoder value per revolution of left wheel and right wheel
-static constexpr int TICK_PER_REVOLUTION = 4000;
-// Min value for PWM that moves wheels
-static constexpr int PWM_THRESHOLD = 100;
+static constexpr unsigned TICK_PER_REVOLUTION = 4000;
+// Minimum PWM value for movement
+static constexpr unsigned PWM_THRESHOLD = 100;
 
-//// PID constants of left wheel
-static constexpr float PID_KP_L = 1.8;
-static constexpr float PID_KI_L = 5;
-static constexpr float PID_KD_L = 0.1;
-//// PID constants of right wheel
-static constexpr float PID_KP_R = 1.8;
-static constexpr float PID_KI_R = 5;
-static constexpr float PID_KD_R = 0.1;
+////// Control parameters
+static constexpr float MOVE_SPEED_PERCENT = 10.0;
+static constexpr float ROTATE_SPEED_PERCENT = 10.0;
 
-////// Network configuration
-static const IPAddress AGENT_IP(192, 168, 1, 115);
-static const uint16_t AGENT_PORT = 8888;
+///// Processing Parameters
+// Run main loop at 50Hz
+static constexpr unsigned LOOP_SLEEP_DURATION_MILLIS = 20;
 
-////// ROS node configuration
-static constexpr const char *ROS_NODE_NAME = "franken_mint_node";
-static constexpr int ROS_EXECUTOR_TIMEOUT = 100; // ms
+////// Network Parameters
+static constexpr const char *AP_NAME = "MintBotAP";
+static constexpr const char *MQTT_CMD_TOPIC = "/mint_bot/cmd";
+static constexpr const char *MQTT_STATE_TOPIC = "/mint_bot/state";
 
-// Update controller at 10Hz.
-static constexpr unsigned int CONTROL_TIMER_PERIOD_MS = 100;
+// Entries for the "Setup" page on the web portal.
+WiFiManager wm;
+WifiManagerParamHelper wm_helper(wm);
+constexpr const char *SETTING_DEVICE_NAME = "device_name";
+constexpr const char *SETTING_MQTT_SERVER = "mqtt_server";
+constexpr const char *SETTING_MQTT_PORT = "mqtt_port";
+constexpr const char *SETTING_MQTT_USERNAME = "mqtt_username";
+constexpr const char *SETTING_MQTT_PASSWORD = "mqtt_password";
 
-// creating a class for motor control
-class PIDFilter
-{
-public:
-  PIDFilter(float proportionalGain, float integralGain, float derivativeGain) : kp(proportionalGain), ki(integralGain), kd(derivativeGain)
-  {
-  }
-
-  float Update(float setpoint, float feedback, float time_delta_sec)
-  {
-    float error = setpoint - feedback;
-    float eintegral = eintegral + (error * time_delta_sec);
-    float ederivative = (error - previous_error) / time_delta_sec;
-    float control_signal = (kp * error) + (ki * eintegral) + (kd * ederivative);
-
-    previous_error = error;
-    return control_signal;
-  }
-
-private:
-  const float kp;
-  const float ki;
-  const float kd;
-  float previous_error = 0;
-};
-
-/**
- * @brief Class for controlling brushed motor speed.
- *
- * This is fairly specific for this differential wheel PID controller. To make
- * it more general, the interface may need to be rethought. Also, the ownership
- * and types of class components (motor/encoder/filter/etc.) would probably need
- * to be reworked.
- */
-class PIDController
-{
-public:
-  // For managing the lifetime of the objects, these should probably be unique
-  // pointers. Leaving them as bare pointers for simplicity.
-  PIDController(BaseMotorCtrl *motor_ctrl,
-                BaseEncoderCtrl *encoder_ctrl,
-                PIDFilter *pid_filter) : motor_ctrl_(motor_ctrl), encoder_ctrl_(encoder_ctrl), pid_filter_(pid_filter) {}
-
-  void Setup()
-  {
-    motor_ctrl_->SetupPins();
-    encoder_ctrl_->SetupPins();
-  }
-
-  EncoderMeasurement Update(float cmd_velocity_mps)
-  {
-    // For single pin encoders:
-    // If the new command reverses the motor direction, any encoder ticks that
-    // occur between the measurement and the new command will be counted
-    // incorrectly.
-    EncoderMeasurement encoder_meas = encoder_ctrl_->GetEncoderMeasurement(is_in_reverse_);
-    float meas_vel_mps = encoder_meas.delta_pos_m / encoder_meas.delta_time_sec;
-
-    float actuating_signal = 0;
-    if (cmd_velocity_mps != 0)
-    {
-      actuating_signal = pid_filter_->Update(cmd_velocity_mps, meas_vel_mps, encoder_meas.delta_time_sec);
-    }
-
-    is_in_reverse_ = actuating_signal < 0;
-    motor_ctrl_->SetSpeed(abs(actuating_signal), is_in_reverse_);
-
-    return encoder_meas;
-  }
-
-private:
-  BaseMotorCtrl *motor_ctrl_ = nullptr;
-  BaseEncoderCtrl *encoder_ctrl_ = nullptr;
-  PIDFilter *pid_filter_ = nullptr;
-  bool is_in_reverse_ = false;
-};
+std::array<ParamEntry, 5> PARAMS = {
+    ParamEntry(SETTING_DEVICE_NAME, "mint_bot"),
+    ParamEntry(SETTING_MQTT_SERVER, "192.168.1.110"),
+    ParamEntry(SETTING_MQTT_PORT, "1883"),
+    ParamEntry(SETTING_MQTT_USERNAME, "public"),
+    ParamEntry(SETTING_MQTT_PASSWORD, "public")};
 
 ////// Global variables
 
 // Motor interface
-SinglePinEncoderCtrl left_encoder(WHEEL_RADIUS, TICK_PER_REVOLUTION, PIN_L_ENCODER, INPUT, FALLING);
-SinglePinEncoderCtrl right_encoder(WHEEL_RADIUS, TICK_PER_REVOLUTION, PIN_R_ENCODER, INPUT, FALLING);
-AT8236MotorCtrl left_motor(PIN_L_FORW, PIN_L_BACK, PWM_THRESHOLD);
-AT8236MotorCtrl right_motor(PIN_R_FORW, PIN_R_BACK, PWM_THRESHOLD);
+static SinglePinEncoderCtrl left_encoder(WHEEL_RADIUS, TICK_PER_REVOLUTION, PIN_L_ENCODER, INPUT, FALLING);
+static SinglePinEncoderCtrl right_encoder(WHEEL_RADIUS, TICK_PER_REVOLUTION, PIN_R_ENCODER, INPUT, FALLING);
+static AT8236MotorCtrl left_motor(PIN_L_FORW, PIN_L_BACK, PWM_THRESHOLD);
+static AT8236MotorCtrl right_motor(PIN_R_FORW, PIN_R_BACK, PWM_THRESHOLD);
 
-// PID interface
-PIDFilter left_wheel_pid(PID_KP_L, PID_KI_L, PID_KD_L);
-PIDFilter right_wheel_pid(PID_KP_R, PID_KI_R, PID_KD_R);
+// Network interface
+static MQTTClient mqtt_client;
+static WiFiClient wifi_client;
+static long long next_reconnect = 0;
 
-PIDController left_ctrl(&right_motor, &right_encoder, &right_wheel_pid);
-PIDController right_ctrl(&right_motor, &right_encoder, &right_wheel_pid);
+///// Motor control classes
 
-// ROS entities
-rclc_executor_t executor;
-rclc_support_t support;
-rcl_allocator_t allocator;
-rcl_node_t node;
-rcl_publisher_t publisher;
-rcl_subscription_t subscriber;
-rcl_timer_t control_timer;
-
-// Message buffers
-geometry_msgs__msg__Twist cmd_msg;
-nav_msgs__msg__Odometry odom_msg;
-
-unsigned long long time_offset = 0;
-unsigned long prev_odom_update = 0;
-Odometry odometry;
-
-// Connection management
-enum class ConnectionState
+enum class CommandType
 {
-  kInitializing,
-  kWaitingForAgent,
-  kConnecting,
-  kConnected,
-  kDisconnected
+  STOP = 0,
+  MOVE = 1,
+  ROTATE = 2
 };
-ConnectionState connection_state = ConnectionState::kInitializing;
 
-struct timespec getTime()
+class MotionController
 {
-  struct timespec tp = {0};
-  // add time difference between uC time and ROS time to
-  // synchronize time with ROS
-  unsigned long long now = millis() + time_offset;
-  tp.tv_sec = now / 1000;
-  tp.tv_nsec = (now % 1000) * 1000000;
-  return tp;
-}
-
-// function which publishes wheel odometry.
-void publishData()
-{
-  odom_msg = odometry.getData();
-
-  struct timespec time_stamp = getTime();
-
-  odom_msg.header.stamp.sec = time_stamp.tv_sec;
-  odom_msg.header.stamp.nanosec = time_stamp.tv_nsec;
-  if (rcl_publish(&publisher, &odom_msg, NULL) != RCL_RET_OK)
+public:
+  void Setup()
   {
-    Serial.println("[PUB] Failed");
-  }
-}
-
-void MotorControllerCallback(rcl_timer_t *timer, int64_t last_call_time)
-{
-  float linearVelocity;
-  float angularVelocity;
-  // linear velocity and angular velocity send cmd_vel topic
-  linearVelocity = cmd_msg.linear.x;
-  angularVelocity = cmd_msg.angular.z;
-  // linear and angular velocities are converted to leftwheel and rightwheel velocities
-  float vL = linearVelocity - (angularVelocity * WHEELS_Y_DISTANCE) / 2.0;
-  float vR = linearVelocity + (angularVelocity * WHEELS_Y_DISTANCE) / 2.0;
-
-  EncoderMeasurement left_encoder_meas = left_ctrl.Update(vL);
-  float left_vel_mps = left_encoder_meas.delta_pos_m / left_encoder_meas.delta_time_sec;
-
-  EncoderMeasurement right_encoder_meas = right_ctrl.Update(vR);
-  float right_vel_mps = right_encoder_meas.delta_pos_m / right_encoder_meas.delta_time_sec;
-
-  // Mean time between encoder measurements.
-  float vel_dt = (left_encoder_meas.delta_time_sec + right_encoder_meas.delta_time_sec) / 2.0;
-
-  // odometry
-  float meas_linear_vel_mps = (left_vel_mps + right_vel_mps) / 2.0;
-  float meas_angular_vel_rps = (right_vel_mps - left_vel_mps) / WHEELS_Y_DISTANCE;
-  odometry.update(
-      vel_dt,
-      meas_linear_vel_mps,
-      0,
-      meas_angular_vel_rps);
-  publishData();
-}
-
-// subscription callback function
-void SubscriptionCallback(const void *msgin)
-{
-  Serial.println("[SUB] Got vel command");
-}
-
-bool CreateEntities()
-{
-  allocator = rcl_get_default_allocator();
-
-  // Initialize options and set domain ID
-  rcl_init_options_t init_options = rcl_get_zero_initialized_init_options();
-  if (rcl_init_options_init(&init_options, allocator) != RCL_RET_OK)
-  {
-    return false;
+    left_encoder.SetupPins();
+    left_motor.SetupPins();
+    right_encoder.SetupPins();
+    right_motor.SetupPins();
+    Stop();
   }
 
-  // Initialize support with domain ID options
-  if (rclc_support_init_with_options(&support, 0, NULL, &init_options, &allocator) != RCL_RET_OK)
+  void StartMovement(CommandType type, float distance)
   {
-    return false;
-  }
-
-  // Clean up initialization options
-  if (rcl_init_options_fini(&init_options) != RCL_RET_OK)
-  {
-    return false;
-  }
-
-  // Initialize node and rest of entities
-  if (rclc_node_init_default(&node, ROS_NODE_NAME, "", &support) != RCL_RET_OK)
-  {
-    return false;
-  }
-
-  // Create publisher
-  if (rclc_publisher_init_default(&publisher, &node,
-                                  ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
-                                  "odom/unfiltered") != RCL_RET_OK)
-  {
-    return false;
-  }
-
-  // Create subscriber
-  if (rclc_subscription_init_default(&subscriber, &node,
-                                     ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
-                                     "cmd_vel") != RCL_RET_OK)
-  {
-    return false;
-  }
-
-  // timer function for controlling the motor base. At every samplingT time
-  // MotorControllerCallback function is called
-  // Here I had set SamplingT=10 Which means at every 10 milliseconds MotorControllerCallback function is called
-  if (rclc_timer_init_default(
-          &control_timer,
-          &support,
-          RCL_MS_TO_NS(CONTROL_TIMER_PERIOD_MS),
-          MotorControllerCallback) != RCL_RET_OK)
-  {
-    return false;
-  }
-
-  // Initialize executor
-  // Handle for subscription and control timer
-  if (rclc_executor_init(&executor, &support.context, 2, &allocator) != RCL_RET_OK)
-  {
-    return false;
-  }
-
-  // Add subscriber to executor
-  if (rclc_executor_add_subscription(&executor, &subscriber, &cmd_msg,
-                                     &SubscriptionCallback, ON_NEW_DATA) != RCL_RET_OK)
-  {
-    return false;
-  }
-
-  if (rclc_executor_add_timer(&executor, &control_timer) != RCL_RET_OK)
-  {
-    return false;
-  }
-
-  return true;
-}
-
-void DestroyEntities()
-{
-  rmw_context_t *rmw_context = rcl_context_get_rmw_context(&support.context);
-  (void)rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
-
-  rcl_ret_t rc = RCL_RET_OK;
-  rc = rcl_timer_fini(&control_timer);
-  rc = rcl_subscription_fini(&subscriber, &node);
-  rc = rcl_publisher_fini(&publisher, &node);
-  rclc_executor_fini(&executor);
-  rc = rcl_node_fini(&node);
-  rclc_support_fini(&support);
-}
-
-void HandleConnectionState()
-{
-  switch (connection_state)
-  {
-  case ConnectionState::kWaitingForAgent:
-    if (RMW_RET_OK == rmw_uros_ping_agent(200, 3))
+    switch (type)
     {
-      Serial.println("[ROS] Agent found, establishing connection...");
-      connection_state = ConnectionState::kConnecting;
+    case CommandType::STOP:
+    {
+      Stop();
     }
     break;
-
-  case ConnectionState::kConnecting:
-    if (CreateEntities())
+    case CommandType::MOVE:
     {
-      Serial.println("[ROS] Connected and ready!");
-      connection_state = ConnectionState::kConnected;
-    }
-    else
-    {
-      Serial.println("[ROS] Connection failed, retrying...");
-      connection_state = ConnectionState::kWaitingForAgent;
+      ClearEncoders();
+      bool is_reverse = distance < 0;
+      left_motor.SetSpeed(MOVE_SPEED_PERCENT, is_reverse);
+      right_motor.SetSpeed(MOVE_SPEED_PERCENT, is_reverse);
+      // The distance in meters each wheel should turn.
+      // Stop point will use the average between the two wheels.
+      target_distance_ = abs(distance);
     }
     break;
-
-  case ConnectionState::kConnected:
-    if (RMW_RET_OK != rmw_uros_ping_agent(200, 3))
+    case CommandType::ROTATE:
     {
-      Serial.println("[ROS] Agent disconnected!");
-      connection_state = ConnectionState::kDisconnected;
+      ClearEncoders();
+      bool is_reverse = distance < 0;
+      left_motor.SetSpeed(ROTATE_SPEED_PERCENT, is_reverse);
+      right_motor.SetSpeed(ROTATE_SPEED_PERCENT, !is_reverse);
+      // This is the distance each wheel should turn to achieve the desired rotation.
+      // Here distance is expected in radians.
+      // Stop point will use the average between the two wheels.
+      target_distance_ = abs(distance) / (WHEELS_Y_DISTANCE * M_PI);
     }
-    else
+    break;
+    }
+    Serial.printf("Target Distance: %fm\n", target_distance_);
+  }
+
+  void Update()
+  {
+    if (target_distance_ == 0)
     {
-      rclc_executor_spin_some(&executor, RCL_MS_TO_NS(ROS_EXECUTOR_TIMEOUT));
+      return;
     }
-    break;
 
-  case ConnectionState::kDisconnected:
-    DestroyEntities();
-    Serial.println("[ROS] Waiting for agent...");
-    connection_state = ConnectionState::kWaitingForAgent;
-    break;
+    BaseEncoderCtrl *encoders[2] = {&left_encoder, &right_encoder};
+    float average_distance = 0;
 
-  default:
-    break;
+    for (int i = 0; i < 2; i++)
+    {
+      auto encoder = encoders[i];
+      EncoderMeasurement encoder_meas = encoder->GetEncoderMeasurement();
+      wheel_distance_[i] += encoder_meas.delta_pos_m;
+      average_distance += wheel_distance_[i] / 2.0;
+    }
+
+    // Check if average distance exceeds target
+    if (average_distance > target_distance_)
+    {
+      Serial.printf("Target Reached %f/%f - LW:%f RW:%f\n", average_distance, target_distance_, wheel_distance_[0], wheel_distance_[1]);
+      Stop();
+    }
+  }
+
+  bool IsMoving() const { return target_distance_ != 0; }
+
+private:
+  float target_distance_ = 0;
+  float wheel_distance_[2] = {0};
+
+  void ClearEncoders()
+  {
+    left_encoder.GetEncoderMeasurement();
+    right_encoder.GetEncoderMeasurement();
+    memset(wheel_distance_, 0, sizeof(wheel_distance_));
+  }
+
+  void Stop()
+  {
+    left_motor.SetSpeed(0);
+    right_motor.SetSpeed(0);
+    target_distance_ = 0;
+  }
+};
+
+static MotionController motion_ctrl;
+// Keeps track of the last published state to check when it changed
+static bool moving_state = true;
+
+static CommandType new_cmd_type = CommandType::STOP;
+static float new_cmd_distance = 0;
+static std::atomic<bool> new_cmd_ready{false};
+
+bool ReconnectMQTT()
+{
+  const char *device_name = wm_helper.GetSettingValue(SETTING_DEVICE_NAME);
+  const char *mqtt_server = wm_helper.GetSettingValue(SETTING_MQTT_SERVER);
+  int mqtt_port = 0;
+  WifiManagerParamHelper::str2int(wm_helper.GetSettingValue(SETTING_MQTT_PORT), &mqtt_port);
+  const char *mqtt_username = wm_helper.GetSettingValue(SETTING_MQTT_USERNAME);
+  const char *mqtt_password = wm_helper.GetSettingValue(SETTING_MQTT_PASSWORD);
+
+  if (next_reconnect > millis() || !WiFi.isConnected() ||
+      strlen(device_name) == 0 ||
+      strlen(mqtt_server) == 0)
+  {
+    return false;
+  }
+
+  if (mqtt_port == 0)
+  {
+    Serial.printf("Invalid port specified \"%s\".\n", wm_helper.GetSettingValue(SETTING_MQTT_PORT));
+  }
+
+  mqtt_client.setHost(mqtt_server, mqtt_port);
+  Serial.print("Attempting MQTT connection...");
+  // Attempt to connect
+  if (mqtt_client.connect(device_name, mqtt_username, mqtt_password))
+  {
+    Serial.println("connected");
+    mqtt_client.subscribe(MQTT_CMD_TOPIC);
+    return true;
+  }
+  else
+  {
+    Serial.print("failed, rc=");
+    Serial.print(mqtt_client.returnCode());
+    Serial.println(" try again in 5 seconds");
+    // Wait 5 seconds before retrying
+    next_reconnect = millis() + 5000;
+  }
+
+  return false;
+}
+
+float GetDistanceFromMessage(String &payload)
+{
+  int idx = payload.indexOf(",");
+  if (idx > 0 && idx < payload.length() - 1)
+  {
+    // atof returns 0 on invalid values.
+    return atof(payload.substring(idx + 1).c_str());
+  }
+  return 0;
+}
+
+void MessageReceived(String &topic, String &payload)
+{
+  Serial.println("incoming: " + topic + " - " + payload);
+
+  if (topic == MQTT_CMD_TOPIC)
+  {
+    if (payload.startsWith("STOP"))
+    {
+      new_cmd_type = CommandType::STOP;
+      new_cmd_distance = 0;
+      new_cmd_ready = true;
+    }
+    else if (payload.startsWith("MOVE"))
+    {
+      new_cmd_type = CommandType::MOVE;
+      new_cmd_distance = GetDistanceFromMessage(payload);
+      new_cmd_ready = true;
+    }
+    else if (payload.startsWith("ROTATE"))
+    {
+      new_cmd_type = CommandType::ROTATE;
+      new_cmd_distance = GetDistanceFromMessage(payload);
+      new_cmd_ready = true;
+    }
   }
 }
 
 void setup()
 {
   Serial.begin(115200);
-  Serial.println("[INIT] Starting micro-ROS node...");
+  WiFi.mode(WIFI_STA); // explicitly set mode, esp defaults to STA+AP
 
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, LOW);
 
-  left_ctrl.Setup();
-  right_ctrl.Setup();
+  motion_ctrl.Setup();
 
-  set_microros_wifi_transports(WIFI_SSID, WIFI_PASSWORD, AGENT_IP, AGENT_PORT);
+  ArduinoOTA
+      .onStart([]()
+               {
+      String type;
+      if (ArduinoOTA.getCommand() == U_FLASH)
+        type = "sketch";
+      else // U_SPIFFS
+        type = "filesystem";
 
-  delay(2000);
-  connection_state = ConnectionState::kWaitingForAgent;
+      // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
+      Serial.println("Start updating " + type); })
+      .onEnd([]()
+             { Serial.println("\nEnd"); })
+      .onProgress([](unsigned int progress, unsigned int total)
+                  { Serial.printf("Progress: %u%%\r", (progress / (total / 100))); })
+      .onError([](ota_error_t error)
+               {
+      Serial.printf("Error[%u]: ", error);
+      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+      else if (error == OTA_END_ERROR) Serial.println("End Failed"); });
+  ArduinoOTA.begin();
+
+  wm_helper.Init(0xBEEF, PARAMS.data(), PARAMS.size());
+  // Configure the WiFiManager
+  wm.setConfigPortalBlocking(false);
+  wm.setParamsPage(true);
+  wm.setTitle("Pixels Dice Gateway");
+
+  // Automatically connect using saved credentials if they exist
+  // If connection fails it starts an access point with the specified name
+  if (wm.autoConnect(AP_NAME))
+  {
+    Serial.println("Auto connect succeeded!");
+  }
+  else
+  {
+    Serial.println("Config portal running");
+  }
+
+  mqtt_client.onMessage(MessageReceived);
+  mqtt_client.begin(wifi_client);
 }
 
 void loop()
 {
-  HandleConnectionState();
-  delay(5); // Prevent tight loop, but don't interfere with update rates.
+  ///// Manage Motor Control and Odometry
+  if (new_cmd_ready)
+  {
+    motion_ctrl.StartMovement(new_cmd_type, new_cmd_distance);
+    new_cmd_ready = false;
+  }
+  motion_ctrl.Update();
+
+  ///// WifiManager Processing
+  // Manage configuration web portal.
+  // Normally, it shuts down once the device is connected, but we want it to always be running.
+  if (!wm.getWebPortalActive() && WiFi.isConnected())
+  {
+    Serial.println("Forcing web portal to start.");
+    wm.startWebPortal();
+  }
+  wm.process();
+
+  ///// Manage MQTT
+  if (!mqtt_client.connected())
+  {
+    ReconnectMQTT();
+  }
+  else
+  {
+    if (moving_state != motion_ctrl.IsMoving())
+    {
+      const char *msg = (motion_ctrl.IsMoving()) ? "1" : "0";
+      mqtt_client.publish(MQTT_STATE_TOPIC, msg, 1, true, 0);
+      moving_state = motion_ctrl.IsMoving();
+    }
+  }
+  mqtt_client.loop();
+
+  ArduinoOTA.handle();
+  delay(LOOP_SLEEP_DURATION_MILLIS);
 }

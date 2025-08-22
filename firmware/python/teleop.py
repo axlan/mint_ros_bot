@@ -8,8 +8,14 @@ import time
 import paho.mqtt.client as mqtt
 
 MQTT_SERVER_ADDR = '192.168.1.110'
-MQTT_CMD_TOPIC = '/mint_bot/cmd'
-MQTT_STATE_TOPIC = '/mint_bot/state'
+MQTT_CMD_TOPIC = 'mint_bot/cmd'
+MQTT_STATE_TOPIC = 'mint_bot/state'
+
+LEFT_POWER=8
+RIGHT_POWER=11
+LINEAR_DISTANCE=0.4
+TURN_90_DEG_DIST=0.1625
+
 
 state = {
     'moving': '0'
@@ -48,13 +54,13 @@ try:
         key = stdscr.getch()
         if key != curses.ERR:
             if key == curses.KEY_UP:
-                new_command = "MOVE,0.1"
+                new_command = f"MANUAL,{LEFT_POWER},{RIGHT_POWER},{LINEAR_DISTANCE},MAX"
             elif key == curses.KEY_DOWN:
-                new_command = "MOVE,-0.1"
+                new_command = f"MANUAL,-{LEFT_POWER},-{RIGHT_POWER},{LINEAR_DISTANCE},MAX"
             elif key == curses.KEY_RIGHT:
-                new_command = f"ROTATE,-{math.pi/2}"
+                new_command = f"MANUAL,{LEFT_POWER},-{RIGHT_POWER},{TURN_90_DEG_DIST},MAX"
             elif key == curses.KEY_LEFT:
-                new_command = f"ROTATE,{math.pi/2}"
+                new_command = f"MANUAL,-{LEFT_POWER},{RIGHT_POWER},{TURN_90_DEG_DIST},MAX"
             else:
                 new_command = "STOP"
                 stdscr.move(2, 0)

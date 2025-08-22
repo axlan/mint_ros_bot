@@ -30,25 +30,22 @@ static constexpr int8_t PIN_L_ENCODER = 27;
 ////// Parameters of the robot
 // Units in meters
 static constexpr float WHEELS_Y_DISTANCE = .173;
-static constexpr float WHEEL_RADIUS = 0.0245;
-static constexpr float WHEEL_CIRCUMFERENCE = 0.153;
+static constexpr float WHEEL_RADIUS = 0.025;
 //// Encoder value per revolution of left wheel and right wheel
-static constexpr unsigned TICK_PER_REVOLUTION = 4000;
+static constexpr unsigned TICK_PER_REVOLUTION = 1160;
 // Minimum PWM value for movement
 static constexpr unsigned PWM_THRESHOLD = 100;
 
 ////// Control parameters
 static constexpr float MOVE_SPEED_PERCENT = 10.0;
 static constexpr float ROTATE_SPEED_PERCENT = 10.0;
+static constexpr unsigned STOP_DURATION_MILLIS = 500;
 
-///// Processing Parameters
-// Run main loop at 50Hz
-static constexpr unsigned LOOP_SLEEP_DURATION_MILLIS = 20;
 
 ////// Network Parameters
 static constexpr const char *AP_NAME = "MintBotAP";
-static constexpr const char *MQTT_CMD_TOPIC = "/mint_bot/cmd";
-static constexpr const char *MQTT_STATE_TOPIC = "/mint_bot/state";
+static constexpr const char *MQTT_CMD_TOPIC = "mint_bot/cmd";
+static constexpr const char *MQTT_STATE_TOPIC = "mint_bot/state";
 
 // Entries for the "Setup" page on the web portal.
 WiFiManager wm;
@@ -81,11 +78,13 @@ static long long next_reconnect = 0;
 
 ///// Motor control classes
 
-enum class CommandType
+enum class EncoderCheckType
 {
-  STOP = 0,
-  MOVE = 1,
-  ROTATE = 2
+  MAX = 0,
+  MIN = 1,
+  MEAN = 2,
+  LEFT = 3,
+  RIGHT = 4
 };
 
 class MotionController
@@ -100,17 +99,29 @@ public:
     Stop();
   }
 
-  void StartMovement(CommandType type, float distance)
+  void StartMovement(const String &cmd_string)
   {
-    switch (type)
+    std::vector<String> args;
+    int start = 0;
+    int end = cmd_string.indexOf(",");
+    while (end != -1)
     {
-    case CommandType::STOP:
+      args.push_back(cmd_string.substring(start, end));
+      start = end + 1;
+      end = cmd_string.indexOf(",", start);
+    }
+    args.push_back(cmd_string.substring(start));
+
+    // ex. "STOP"
+    if (cmd_string.startsWith("STOP"))
     {
       Stop();
     }
-    break;
-    case CommandType::MOVE:
+    // ex. "MOVE,-1.2"
+    else if (args.size() == 2 && args[0] == "MOVE")
     {
+      float distance = atof(args[1].c_str());
+      check_type_ = EncoderCheckType::MEAN;
       ClearEncoders();
       bool is_reverse = distance < 0;
       left_motor.SetSpeed(MOVE_SPEED_PERCENT, is_reverse);
@@ -119,45 +130,133 @@ public:
       // Stop point will use the average between the two wheels.
       target_distance_ = abs(distance);
     }
-    break;
-    case CommandType::ROTATE:
+    // ex. "ROTATE,3.14"
+    else if (args.size() == 2 && args[0] == "ROTATE")
     {
+      float angle = atof(args[1].c_str());
+      check_type_ = EncoderCheckType::MEAN;
       ClearEncoders();
-      bool is_reverse = distance < 0;
+      bool is_reverse = angle < 0;
       left_motor.SetSpeed(ROTATE_SPEED_PERCENT, is_reverse);
       right_motor.SetSpeed(ROTATE_SPEED_PERCENT, !is_reverse);
       // This is the distance each wheel should turn to achieve the desired rotation.
       // Here distance is expected in radians.
       // Stop point will use the average between the two wheels.
-      target_distance_ = abs(distance) / (WHEELS_Y_DISTANCE * M_PI);
+      target_distance_ = abs(angle) / (WHEELS_Y_DISTANCE * M_PI);
     }
-    break;
+    // MANUAL,<LEFT PERCENT SPEED>,<RIGHT PERCENT SPEED>,<DISTANCE>,<ENCODER CHECK>
+    // ex. "MANUAL,3.14"
+    else if (args.size() == 5 && args[0] == "MANUAL")
+    {
+      float left_speed = atof(args[1].c_str());
+      bool left_is_reverse = left_speed < 0;
+      float right_speed = atof(args[2].c_str());
+      bool right_is_reverse = right_speed < 0;
+      target_distance_ = atof(args[3].c_str());
+      String check_type_str = args[4];
+      if (check_type_str == "MIN")
+      {
+        check_type_ = EncoderCheckType::MIN;
+      }
+      else if (check_type_str == "MAX")
+      {
+        check_type_ = EncoderCheckType::MAX;
+      }
+      else if (check_type_str == "MEAN")
+      {
+        check_type_ = EncoderCheckType::MEAN;
+      }
+      else if (check_type_str == "LEFT")
+      {
+        check_type_ = EncoderCheckType::LEFT;
+      }
+      else if (check_type_str == "RIGHT")
+      {
+        check_type_ = EncoderCheckType::RIGHT;
+      }
+      else
+      {
+        check_type_ = EncoderCheckType::MIN; // Default fallback
+      }
+
+      ClearEncoders();
+      left_motor.SetSpeed(left_speed, left_is_reverse);
+      right_motor.SetSpeed(right_speed, right_is_reverse);
     }
+    else
+    {
+      return;
+    }
+
     Serial.printf("Target Distance: %fm\n", target_distance_);
   }
 
   void Update()
   {
+    if (stop_start_time_ != 0) {
+      if (millis() - stop_start_time_ > STOP_DURATION_MILLIS) {
+        left_motor.SetSpeed(0);
+        right_motor.SetSpeed(0);
+        stop_start_time_ = 0;
+      }
+      return;
+    }
+
     if (target_distance_ == 0)
     {
       return;
     }
 
     BaseEncoderCtrl *encoders[2] = {&left_encoder, &right_encoder};
-    float average_distance = 0;
 
     for (int i = 0; i < 2; i++)
     {
       auto encoder = encoders[i];
       EncoderMeasurement encoder_meas = encoder->GetEncoderMeasurement();
       wheel_distance_[i] += encoder_meas.delta_pos_m;
-      average_distance += wheel_distance_[i] / 2.0;
+    }
+
+    float check_distance = 0;
+    const char *check_str = "";
+
+    switch (check_type_)
+    {
+    case EncoderCheckType::MIN:
+    {
+      check_str = "MIN";
+      check_distance = min(wheel_distance_[0], wheel_distance_[1]);
+    }
+    break;
+    case EncoderCheckType::MAX:
+    {
+      check_str = "MAX";
+      check_distance = max(wheel_distance_[0], wheel_distance_[1]);
+    }
+    break;
+    case EncoderCheckType::MEAN:
+    {
+      check_str = "MEAN";
+      check_distance = (wheel_distance_[0] + wheel_distance_[1]) / 2.0;
+    }
+    break;
+    case EncoderCheckType::LEFT:
+    {
+      check_str = "LEFT";
+      check_distance = wheel_distance_[0];
+    }
+    break;
+    case EncoderCheckType::RIGHT:
+    {
+      check_str = "RIGHT";
+      check_distance = wheel_distance_[1];
+    }
+    break;
     }
 
     // Check if average distance exceeds target
-    if (average_distance > target_distance_)
+    if (check_distance >= target_distance_)
     {
-      Serial.printf("Target Reached %f/%f - LW:%f RW:%f\n", average_distance, target_distance_, wheel_distance_[0], wheel_distance_[1]);
+      Serial.printf("Target Reached %s %f/%f - LW:%f RW:%f\n", check_str, check_distance, target_distance_, wheel_distance_[0], wheel_distance_[1]);
       Stop();
     }
   }
@@ -166,7 +265,9 @@ public:
 
 private:
   float target_distance_ = 0;
+  EncoderCheckType check_type_ = EncoderCheckType::MIN;
   float wheel_distance_[2] = {0};
+  unsigned stop_start_time_ = 0;
 
   void ClearEncoders()
   {
@@ -177,9 +278,10 @@ private:
 
   void Stop()
   {
-    left_motor.SetSpeed(0);
-    right_motor.SetSpeed(0);
+    left_motor.Brake();
+    right_motor.Brake();
     target_distance_ = 0;
+    stop_start_time_ = millis();
   }
 };
 
@@ -187,8 +289,7 @@ static MotionController motion_ctrl;
 // Keeps track of the last published state to check when it changed
 static bool moving_state = true;
 
-static CommandType new_cmd_type = CommandType::STOP;
-static float new_cmd_distance = 0;
+static String new_cmd;
 static std::atomic<bool> new_cmd_ready{false};
 
 bool ReconnectMQTT()
@@ -233,41 +334,14 @@ bool ReconnectMQTT()
   return false;
 }
 
-float GetDistanceFromMessage(String &payload)
-{
-  int idx = payload.indexOf(",");
-  if (idx > 0 && idx < payload.length() - 1)
-  {
-    // atof returns 0 on invalid values.
-    return atof(payload.substring(idx + 1).c_str());
-  }
-  return 0;
-}
-
 void MessageReceived(String &topic, String &payload)
 {
   Serial.println("incoming: " + topic + " - " + payload);
 
   if (topic == MQTT_CMD_TOPIC)
   {
-    if (payload.startsWith("STOP"))
-    {
-      new_cmd_type = CommandType::STOP;
-      new_cmd_distance = 0;
-      new_cmd_ready = true;
-    }
-    else if (payload.startsWith("MOVE"))
-    {
-      new_cmd_type = CommandType::MOVE;
-      new_cmd_distance = GetDistanceFromMessage(payload);
-      new_cmd_ready = true;
-    }
-    else if (payload.startsWith("ROTATE"))
-    {
-      new_cmd_type = CommandType::ROTATE;
-      new_cmd_distance = GetDistanceFromMessage(payload);
-      new_cmd_ready = true;
-    }
+    new_cmd = payload;
+    new_cmd_ready = true;
   }
 }
 
@@ -332,8 +406,9 @@ void loop()
   ///// Manage Motor Control and Odometry
   if (new_cmd_ready)
   {
-    motion_ctrl.StartMovement(new_cmd_type, new_cmd_distance);
+    String cmd = new_cmd;
     new_cmd_ready = false;
+    motion_ctrl.StartMovement(cmd);
   }
   motion_ctrl.Update();
 
@@ -364,5 +439,4 @@ void loop()
   mqtt_client.loop();
 
   ArduinoOTA.handle();
-  delay(LOOP_SLEEP_DURATION_MILLIS);
 }

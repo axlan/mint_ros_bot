@@ -1,3 +1,5 @@
+#include <atomic>
+
 #include <Arduino.h>
 #include <ArduinoOTA.h>
 
